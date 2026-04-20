@@ -1,0 +1,15 @@
+Source: gpures
+Section: utils
+Priority: optional
+Maintainer: gpures maintainers <root@localhost>
+Build-Depends: debhelper-compat (= 13), dh-python, python3-all, python3-setuptools
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: gpures
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}, python3
+Description: Trust-based GPU reservation CLI for shared Linux servers
+ gpures provides a system-wide command for recording and viewing GPU
+ reservations. It is intentionally trust-based: it does not enforce device
+ access or alter process permissions.

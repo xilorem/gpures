@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpures"
+version = "0.1.0"
+description = "Rootless trust-based GPU reservation CLI for shared Linux servers"
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+license = { text = "MIT" }
+
+[project.scripts]
+gpures = "gpures.cli:main"
