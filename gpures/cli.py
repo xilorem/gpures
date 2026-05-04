@@ -674,6 +674,41 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_YELLOW)
         curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)
+
+    use_utf8 = getattr(sys.stdout, "encoding", "") in (
+        "utf-8", "UTF-8", "utf8", "UTF8", "utf_8", "UTF_8"
+    )
+    if use_utf8:
+        chars = {
+            "bg": "·",
+            "sep": "│",
+            "rule": "─",
+            "junction": "┼",
+            "block_left": "├",
+            "block_right": "┤",
+            "block_body": "█",
+            "block_label": "▓",
+            "now_row": "│",
+            "now_header": "▲",
+            "now_footer": "▼",
+            "selection": "░",
+        }
+    else:
+        chars = {
+            "bg": ".",
+            "sep": "|",
+            "rule": "-",
+            "junction": "+",
+            "block_left": "+",
+            "block_right": "+",
+            "block_body": "#",
+            "block_label": "#",
+            "now_row": "|",
+            "now_header": "^",
+            "now_footer": "v",
+            "selection": "~",
+        }
 
     while True:
         start, end = clip_tui_window(start, duration)
@@ -682,6 +717,24 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
         reservations = store.reservations_between(start, end)
         selected = min(selected, max(0, len(gpus) - 1))
         scroll = min(scroll, max(0, len(gpus) - 1))
+
+        user_color_map = {}
+        if curses.has_colors():
+            palette = [
+                (curses.COLOR_WHITE, curses.COLOR_RED),
+                (curses.COLOR_BLACK, curses.COLOR_GREEN),
+                (curses.COLOR_WHITE, curses.COLOR_MAGENTA),
+                (curses.COLOR_BLACK, curses.COLOR_YELLOW),
+                (curses.COLOR_WHITE, curses.COLOR_CYAN),
+                (curses.COLOR_WHITE, curses.COLOR_BLUE),
+                (curses.COLOR_BLACK, curses.COLOR_CYAN),
+                (curses.COLOR_BLACK, curses.COLOR_MAGENTA),
+            ]
+            pair_start = 6
+            usernames = sorted({row["username"] for row in reservations})
+            for idx, username in enumerate(usernames):
+                curses.init_pair(pair_start + idx, *palette[idx % len(palette)])
+                user_color_map[username] = pair_start + idx
 
         stdscr.erase()
         height, width = stdscr.getmaxyx()
@@ -699,54 +752,79 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
         safe_add(stdscr, 0, 0, f"gpures calendar TUI  {fmt_span(start, end)}", width, curses.A_BOLD)
         safe_add(stdscr, 1, 0, help_text, width)
         safe_add(stdscr, 3, 0, "GPU", 12, curses.A_BOLD)
+        safe_add(stdscr, 3, 12, chars["sep"], 1, curses.A_BOLD)
         safe_add(stdscr, 3, timeline_x, timeline_header(start, end, timeline_width), timeline_width, curses.A_BOLD)
 
-        visible_rows = max(0, height - 7)
+        rule = chars["rule"] * 12 + chars["junction"] + chars["rule"] * timeline_width
+        safe_add(stdscr, 4, 0, rule, width)
+
+        visible_rows = max(0, height - 8)
         if selected < scroll:
             scroll = selected
         if selected >= scroll + visible_rows:
             scroll = selected - visible_rows + 1
 
+        now = datetime.now().astimezone().replace(microsecond=0)
+        now_x = time_to_cursor(now, start, duration, timeline_width) if start <= now <= (start + duration) else None
+        now_attr = curses.color_pair(5) if curses.has_colors() else curses.A_BOLD
+
         for index, gpu in enumerate(gpus[scroll : scroll + visible_rows], start=scroll):
-            y = 4 + index - scroll
+            y = 5 + index - scroll
             attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
             safe_add(stdscr, y, 0, f"{gpu['gpu_id']} {gpu['name']}", 12, attr)
+            safe_add(stdscr, y, 12, chars["sep"], 1, attr)
 
-            row_chars = list("." * timeline_width)
+            row_chars = list(chars["bg"] * timeline_width)
 
-            for left, right, reservation in positions.get(gpu["gpu_id"], []):
+            gpu_positions = positions.get(gpu["gpu_id"], [])
+            for left, right, reservation in gpu_positions:
                 block_width = max(1, right - left)
-                label = f"#{reservation['id']} {reservation['username']}"
-                for ci in range(left, min(right, timeline_width)):
-                    idx = ci - left
-                    row_chars[ci] = label[idx] if idx < len(label) else "#"
+                if block_width <= 1:
+                    row_chars[left] = chars["block_body"]
+                else:
+                    label = f"#{reservation['id']} {reservation['username']}"
+                    row_chars[left] = chars["block_left"]
+                    for ci in range(left + 1, min(right - 1, timeline_width)):
+                        idx = ci - left
+                        row_chars[ci] = label[idx] if idx < len(label) else chars["block_label"]
+                    row_chars[min(right - 1, timeline_width - 1)] = chars["block_right"]
+                    if right - left <= 2:
+                        row_chars[left] = chars["block_body"]
+                        if right > 1:
+                            row_chars[min(right - 1, timeline_width - 1)] = chars["block_body"]
+
+            if now_x is not None:
+                row_chars[now_x] = chars["now_row"]
 
             if index == selected and gpus:
                 cursor_x = max(0, min(timeline_width - 1, cursor_x))
-                if mode == "normal":
-                    row_chars[cursor_x] = "^"
-                elif mode == "selecting" and selection_start_x is not None:
+                if mode == "selecting" and selection_start_x is not None:
                     sel_left = min(selection_start_x, cursor_x)
                     sel_right = max(selection_start_x, cursor_x)
-                    sel_attr = curses.color_pair(4) if curses.has_colors() else curses.A_REVERSE
                     for ci in range(sel_left, min(sel_right + 1, timeline_width)):
-                        row_chars[ci] = "~"
-                    row_chars[cursor_x] = "^"
-                    row_chars[selection_start_x] = "|"
+                        row_chars[ci] = chars["selection"]
+                    row_chars[selection_start_x] = chars["sep"]
+                    row_chars[cursor_x] = chars["now_footer"]
+                else:
+                    row_chars[cursor_x] = chars["now_footer"]
 
             safe_add(stdscr, y, timeline_x, "".join(row_chars), timeline_width)
 
-            if index == selected and mode == "selecting" and selection_start_x is not None:
-                sel_attr = curses.color_pair(4) if curses.has_colors() else curses.A_REVERSE
-                sel_left = min(selection_start_x, cursor_x)
-                sel_right = max(selection_start_x, cursor_x)
-                block_width = max(1, sel_right - sel_left + 1)
-                safe_add(stdscr, y, timeline_x + sel_left, "~" * block_width, block_width, sel_attr)
-                safe_add(stdscr, y, timeline_x + selection_start_x, "|", 1, sel_attr)
-                if cursor_x < timeline_width:
-                    safe_add(stdscr, y, timeline_x + cursor_x, "^", 1, sel_attr)
+            for left, right, reservation in gpu_positions:
+                block_width = max(1, right - left)
+                username = reservation["username"]
+                pair_idx = user_color_map.get(username)
+                if pair_idx is not None:
+                    attr = curses.color_pair(pair_idx)
+                    block_text = "".join(row_chars[left:right])
+                    safe_add(stdscr, y, timeline_x + left, block_text, block_width, attr)
+
+            if now_x is not None:
+                safe_add(stdscr, y, timeline_x + now_x, chars["now_row"], 1, now_attr)
 
         detail_y = height - 2
+        if now_x is not None:
+            safe_add(stdscr, 3, timeline_x + now_x, chars["now_header"], 1, now_attr)
         if mode == "reason":
             prompt = f"Reason: {reason_text}"
             if height > 2:
@@ -766,6 +844,9 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
             sel_end_time = cursor_to_time(cursor_x, start, duration, timeline_width)
             info = f"Selecting: {fmt_dt(sel_start_time)} -> {fmt_dt(sel_end_time)}  ({int((sel_end_time - sel_start_time).total_seconds() / 60)}m)"
             safe_add(stdscr, info_y, 0, info, width, curses.A_BOLD)
+
+        if now_x is not None:
+            safe_add(stdscr, height - 1, timeline_x + now_x, chars["now_footer"], 1, now_attr)
 
         stdscr.refresh()
         key = stdscr.getch()
