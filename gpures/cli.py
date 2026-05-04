@@ -611,6 +611,16 @@ def clip_tui_window(start: datetime, duration: timedelta) -> tuple[datetime, dat
     return start, end
 
 
+def cursor_to_time(cursor_x: int, start: datetime, duration: timedelta, timeline_width: int) -> datetime:
+    fraction = cursor_x / max(1, timeline_width)
+    return start + timedelta(seconds=fraction * duration.total_seconds())
+
+
+def time_to_cursor(dt: datetime, start: datetime, duration: timedelta, timeline_width: int) -> int:
+    fraction = (dt - start).total_seconds() / max(1, duration.total_seconds())
+    return max(0, min(timeline_width - 1, int(fraction * timeline_width)))
+
+
 def reservation_positions(
     reservations: list[sqlite3.Row],
     start: datetime,
@@ -649,6 +659,13 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
     scroll = 0
     selected = 0
 
+    mode = "normal"
+    cursor_x = 0
+    selection_start_x = None
+    selection_start_time = None
+    reason_text = ""
+    status_msg = ""
+
     curses.curs_set(0)
     stdscr.nodelay(False)
     if curses.has_colors():
@@ -656,6 +673,7 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_GREEN)
         curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN)
 
     while True:
         start, end = clip_tui_window(start, duration)
@@ -671,8 +689,15 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
         timeline_width = max(10, width - timeline_x - 1)
         positions = reservation_positions(reservations, start, end, timeline_width)
 
+        if mode == "normal":
+            help_text = "q quit  arrows move cursor  s select range  h/l shift 6h  [/ ] shift 1d  +/- zoom  r refresh"
+        elif mode == "selecting":
+            help_text = "s confirm end  h/l shrink/extend 6h  Esc cancel  r refresh"
+        else:
+            help_text = "Enter to confirm  Esc cancel"
+
         safe_add(stdscr, 0, 0, f"gpures calendar TUI  {fmt_span(start, end)}", width, curses.A_BOLD)
-        safe_add(stdscr, 1, 0, "q quit  arrows/hjkl move  H/L shift 6h  [/ ] shift 1d  +/- zoom  r refresh", width)
+        safe_add(stdscr, 1, 0, help_text, width)
         safe_add(stdscr, 3, 0, "GPU", 12, curses.A_BOLD)
         safe_add(stdscr, 3, timeline_x, timeline_header(start, end, timeline_width), timeline_width, curses.A_BOLD)
 
@@ -686,43 +711,223 @@ def run_calendar_tui(stdscr, args, start: datetime, duration: timedelta) -> None
             y = 4 + index - scroll
             attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
             safe_add(stdscr, y, 0, f"{gpu['gpu_id']} {gpu['name']}", 12, attr)
-            safe_add(stdscr, y, timeline_x, "." * timeline_width, timeline_width)
+
+            row_chars = list("." * timeline_width)
+
             for left, right, reservation in positions.get(gpu["gpu_id"], []):
-                block_attr = curses.color_pair(2) if curses.has_colors() else curses.A_REVERSE
-                label = f"#{reservation['id']} {reservation['username']}"
                 block_width = max(1, right - left)
-                safe_add(stdscr, y, timeline_x + left, label[:block_width].ljust(block_width, "#"), block_width, block_attr)
+                label = f"#{reservation['id']} {reservation['username']}"
+                for ci in range(left, min(right, timeline_width)):
+                    idx = ci - left
+                    row_chars[ci] = label[idx] if idx < len(label) else "#"
+
+            if index == selected and gpus:
+                cursor_x = max(0, min(timeline_width - 1, cursor_x))
+                if mode == "normal":
+                    row_chars[cursor_x] = "^"
+                elif mode == "selecting" and selection_start_x is not None:
+                    sel_left = min(selection_start_x, cursor_x)
+                    sel_right = max(selection_start_x, cursor_x)
+                    sel_attr = curses.color_pair(4) if curses.has_colors() else curses.A_REVERSE
+                    for ci in range(sel_left, min(sel_right + 1, timeline_width)):
+                        row_chars[ci] = "~"
+                    row_chars[cursor_x] = "^"
+                    row_chars[selection_start_x] = "|"
+
+            safe_add(stdscr, y, timeline_x, "".join(row_chars), timeline_width)
+
+            if index == selected and mode == "selecting" and selection_start_x is not None:
+                sel_attr = curses.color_pair(4) if curses.has_colors() else curses.A_REVERSE
+                sel_left = min(selection_start_x, cursor_x)
+                sel_right = max(selection_start_x, cursor_x)
+                block_width = max(1, sel_right - sel_left + 1)
+                safe_add(stdscr, y, timeline_x + sel_left, "~" * block_width, block_width, sel_attr)
+                safe_add(stdscr, y, timeline_x + selection_start_x, "|", 1, sel_attr)
+                if cursor_x < timeline_width:
+                    safe_add(stdscr, y, timeline_x + cursor_x, "^", 1, sel_attr)
 
         detail_y = height - 2
-        if gpus:
+        if mode == "reason":
+            prompt = f"Reason: {reason_text}"
+            if height > 2:
+                safe_add(stdscr, detail_y, 0, prompt.ljust(width)[:width], width, curses.color_pair(3) if curses.has_colors() else curses.A_BOLD)
+        elif status_msg:
+            safe_add(stdscr, detail_y, 0, status_msg.ljust(width)[:width], width, curses.color_pair(3) if curses.has_colors() else curses.A_BOLD)
+        elif gpus:
             selected_gpu = gpus[selected]["gpu_id"]
             details = details_for_gpu(selected_gpu, positions.get(selected_gpu, []), start, end)
             safe_add(stdscr, detail_y, 0, details, width, curses.color_pair(3) if curses.has_colors() else curses.A_BOLD)
         else:
             safe_add(stdscr, detail_y, 0, "No GPUs configured or detected", width, curses.A_BOLD)
 
+        if mode == "selecting" and selection_start_x is not None:
+            info_y = detail_y - 1
+            sel_start_time = cursor_to_time(selection_start_x, start, duration, timeline_width)
+            sel_end_time = cursor_to_time(cursor_x, start, duration, timeline_width)
+            info = f"Selecting: {fmt_dt(sel_start_time)} -> {fmt_dt(sel_end_time)}  ({int((sel_end_time - sel_start_time).total_seconds() / 60)}m)"
+            safe_add(stdscr, info_y, 0, info, width, curses.A_BOLD)
+
         stdscr.refresh()
         key = stdscr.getch()
+
         if key in (ord("q"), ord("Q")):
             break
-        if key in (curses.KEY_DOWN, ord("j")):
-            selected = min(selected + 1, max(0, len(gpus) - 1))
-        elif key in (curses.KEY_UP, ord("k")):
-            selected = max(0, selected - 1)
-        elif key in (curses.KEY_RIGHT, ord("l"), ord("L")):
-            start += timedelta(hours=6)
-        elif key in (curses.KEY_LEFT, ord("h"), ord("H")):
-            start -= timedelta(hours=6)
-        elif key == ord("]"):
-            start += timedelta(days=1)
-        elif key == ord("["):
-            start -= timedelta(days=1)
-        elif key in (ord("+"), ord("=")):
-            duration = max(timedelta(hours=1), duration / 2)
-        elif key in (ord("-"), ord("_")):
-            duration = min(DEFAULT_MAX_ADVANCE, duration * 2)
-        elif key in (ord("r"), ord("R")):
+
+        if mode == "reason":
+            if key in (curses.KEY_ENTER, 10, 13):
+                if not gpus:
+                    status_msg = "No GPU selected"
+                    mode = "normal"
+                    continue
+                sel_start_time = selection_start_time
+                sel_end_time = cursor_to_time(cursor_x, start, duration, timeline_width)
+                if sel_end_time <= sel_start_time:
+                    status_msg = "End must be after start"
+                    mode = "normal"
+                    continue
+                now = datetime.now().astimezone().replace(microsecond=0)
+                if sel_start_time < now:
+                    status_msg = "Start time is in the past"
+                    mode = "normal"
+                    continue
+                horizon_end = now + DEFAULT_MAX_ADVANCE
+                if sel_start_time > horizon_end or sel_end_time > horizon_end:
+                    status_msg = "Reservation must be within the next 7 days"
+                    mode = "normal"
+                    continue
+                try:
+                    rid = store.reserve(
+                        getpass.getuser(),
+                        [gpus[selected]["gpu_id"]],
+                        sel_start_time,
+                        sel_end_time,
+                        reason_text if reason_text else None,
+                    )
+                    status_msg = f"Reserved GPU {gpus[selected]['gpu_id']} (id {rid})"
+                except RuntimeError as exc:
+                    status_msg = str(exc)
+                    mode = "selecting"
+                    reason_text = ""
+                    continue
+                mode = "normal"
+                cursor_x = 0
+                selection_start_x = None
+                selection_start_time = None
+                reason_text = ""
+            elif key in (27,):
+                mode = "normal"
+                cursor_x = 0
+                selection_start_x = None
+                selection_start_time = None
+                reason_text = ""
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                reason_text = reason_text[:-1]
+            elif 32 <= key <= 126:
+                reason_text += chr(key)
             continue
+
+        if mode == "selecting":
+            if key in (ord("s"), ord("S")):
+                sel_start_time = selection_start_time
+                sel_end_time = cursor_to_time(cursor_x, start, duration, timeline_width)
+                if sel_end_time <= sel_start_time:
+                    status_msg = "End must be after start"
+                    mode = "normal"
+                    selection_start_x = None
+                    continue
+                now = datetime.now().astimezone().replace(microsecond=0)
+                if sel_start_time < now - timedelta(seconds=60):
+                    status_msg = "Start time is in the past"
+                    mode = "normal"
+                    selection_start_x = None
+                    continue
+                mode = "reason"
+                reason_text = ""
+                continue
+            if key in (27,):
+                mode = "normal"
+                cursor_x = 0
+                selection_start_x = None
+                selection_start_time = None
+                status_msg = ""
+                continue
+            if key == curses.KEY_LEFT:
+                if cursor_x > selection_start_x:
+                    cursor_x -= 1
+                elif cursor_x == 0:
+                    start -= duration / 2
+                else:
+                    cursor_x = selection_start_x
+            elif key == curses.KEY_RIGHT:
+                if cursor_x < timeline_width - 1:
+                    cursor_x += 1
+                else:
+                    start += duration / 2
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = min(selected + 1, max(0, len(gpus) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key in (ord("h"), ord("H")):
+                six_h_px = max(1, int(timeline_width * 6 / duration.total_seconds() * 3600))
+                cursor_x = max(selection_start_x + 1, cursor_x - six_h_px)
+            elif key in (ord("l"), ord("L")):
+                six_h_px = max(1, int(timeline_width * 6 / duration.total_seconds() * 3600))
+                cursor_x = min(timeline_width - 1, cursor_x + six_h_px)
+            elif key == ord("]"):
+                start += timedelta(days=1)
+            elif key == ord("["):
+                start -= timedelta(days=1)
+            elif key in (ord("+"), ord("=")):
+                duration = max(timedelta(hours=1), duration / 2)
+            elif key in (ord("-"), ord("_")):
+                duration = min(DEFAULT_MAX_ADVANCE, duration * 2)
+            elif key in (ord("r"), ord("R")):
+                continue
+            continue
+
+        if mode == "normal":
+            if key in (ord("s"), ord("S")):
+                if not gpus:
+                    status_msg = "No GPU selected"
+                    continue
+                now = datetime.now().astimezone().replace(microsecond=0)
+                cursor_time = cursor_to_time(cursor_x, start, duration, timeline_width)
+                if cursor_time < now - timedelta(seconds=60):
+                    status_msg = "Cursor position is in the past"
+                    continue
+                selection_start_x = cursor_x
+                selection_start_time = cursor_time
+                mode = "selecting"
+                status_msg = ""
+                continue
+            if key == curses.KEY_LEFT:
+                if cursor_x > 0:
+                    cursor_x -= 1
+                else:
+                    start -= duration / 2
+            elif key == curses.KEY_RIGHT:
+                if cursor_x < timeline_width - 1:
+                    cursor_x += 1
+                else:
+                    start += duration / 2
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = min(selected + 1, max(0, len(gpus) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key in (ord("h"), ord("H")):
+                start -= timedelta(hours=6)
+            elif key in (ord("l"), ord("L")):
+                start += timedelta(hours=6)
+            elif key == ord("]"):
+                start += timedelta(days=1)
+            elif key == ord("["):
+                start -= timedelta(days=1)
+            elif key in (ord("+"), ord("=")):
+                duration = max(timedelta(hours=1), duration / 2)
+            elif key in (ord("-"), ord("_")):
+                duration = min(DEFAULT_MAX_ADVANCE, duration * 2)
+            elif key in (ord("r"), ord("R")):
+                continue
 
 
 def safe_add(stdscr, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
